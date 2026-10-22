@@ -1,0 +1,50 @@
+name: build-split-nowidth
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21 (Gradle 9.6 / AGP 9)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: JDK 17 (Kotlin toolchain)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq openjdk-17-jdk-headless
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK components
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+            "cmake;3.31.6" "ndk;28.2.13676358" "ndk;29.0.14206865"
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Fetch upstream + apply patch
+        run: |
+          git clone --depth 1 https://github.com/ruzhe85/MihonSY.git src
+          cd src
+          patch -p1 --verbose < ../split-no-width-detect.patch
+          grep -n "拆分双页不检测宽度" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPageHolder.kt
+
+      - name: Gradle build
+        working-directory: src
+        run: ./gradlew :app:assembleRelease -PmihonsyUniversal=true --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MihonSY-split-nowidth
+          path: |
+            src/app/build/outputs/apk/**/*.apk
+            src/app/build/outputs/logs/*.txt
+          if-no-files-found: warn
