@@ -1,0 +1,32 @@
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPageHolder.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPageHolder.kt
+@@ -590,11 +590,8 @@
+             return splitInHalf(imageSource)
+         }
+ 
+-        val isDoublePage = ImageUtil.isWideImage(imageSource)
+-        if (!isDoublePage) {
+-            return imageSource
+-        }
+-
++        // MihonSY-patch（拆分双页不检测宽度）：只要「拆分双页」开着，每一页都拆，
++        // 不再用 isWideImage(outWidth > outHeight) 过滤。单页会被从中间切开。
+         onPageSplit(page)
+ 
+         return splitInHalf(imageSource)
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPreparedCache.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPreparedCache.kt
+@@ -288,11 +288,8 @@
+             return splitInHalfPure(viewer, page, imageSource)
+         }
+ 
+-        if (!ImageUtil.isWideImage(imageSource)) {
+-            return imageSource
+-        }
+-
+-        // 宽页 + 双页分割：旧管线会 onPageSplit 插入 InsertPage（副作用）→ 放弃
++        // MihonSY-patch（拆分双页不检测宽度）：非 InsertPage 一律走「holder 补跑布局」，
++        // 由 PagerPageHolder.process() 执行 onPageSplit + splitInHalf。
+         return null
+     }
+ 
