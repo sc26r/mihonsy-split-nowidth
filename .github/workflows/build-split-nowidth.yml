@@ -1,4 +1,4 @@
-name: build-split-nowidth
+name: build-roll
 
 on:
   workflow_dispatch:
@@ -40,26 +40,33 @@ jobs:
             "cmake;3.31.6" "ndk;28.2.13676358" 2>&1 | grep -vE "^\[=*" | tail -5 || true
           echo "sdk.dir=$SDK" >> "$GITHUB_ENV"
 
-      - name: Fetch upstream + apply patch
+      - name: Fetch upstream + apply patches
         run: |
           set -eux
           git clone --depth 1 https://github.com/ruzhe85/MihonSY.git src
           cd src
           patch -p1 --verbose < ../split-no-width-detect.patch
+          patch -p1 --verbose < ../roll-page-turn.patch
           grep -n "拆分双页不检测宽度" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPageHolder.kt
+          grep -n "RollPageTransformer" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
           echo "sdk.dir=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}" > local.properties
 
-      - name: Generate signing key (repo ships none)
-        working-directory: src
+      - name: Signing key
         run: |
           set -eux
-          mkdir -p keystore
-          keytool -genkeypair -v \
-            -keystore keystore/mihonmod.jks \
-            -storetype PKCS12 \
-            -storepass mihonmod123 -keypass mihonmod123 \
-            -alias mihonmod -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=MihonSY-NoSplitWidth, O=Local, C=CN"
+          mkdir -p src/keystore
+          if [ -f keystore/mihonmod.jks ]; then
+            cp keystore/mihonmod.jks src/keystore/mihonmod.jks
+            echo "reused committed keystore"
+          else
+            keytool -genkeypair -v \
+              -keystore src/keystore/mihonmod.jks \
+              -storetype PKCS12 \
+              -storepass mihonmod123 -keypass mihonmod123 \
+              -alias mihonmod -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=MihonSY-NoSplitWidth, O=Local, C=CN"
+            echo "KEYSTORE_B64:$(base64 -w0 src/keystore/mihonmod.jks)"
+          fi
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -82,7 +89,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: MihonSY-split-nowidth
+          name: MihonSY-roll
           path: |
             src/app/build/outputs/apk/**/*.apk
             src/app/build/outputs/mapping/**/*.txt
