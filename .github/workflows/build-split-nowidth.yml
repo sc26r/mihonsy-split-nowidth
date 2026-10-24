@@ -57,7 +57,10 @@ jobs:
           mkdir -p src/keystore
           if [ -f keystore/mihonmod.jks ]; then
             cp keystore/mihonmod.jks src/keystore/mihonmod.jks
-            echo "reused committed keystore"
+            echo "reused committed keystore (raw)"
+          elif [ -f keystore/mihonmod.jks.b64 ]; then
+            base64 -d keystore/mihonmod.jks.b64 > src/keystore/mihonmod.jks
+            echo "reused committed keystore (b64)"
           else
             keytool -genkeypair -v \
               -keystore src/keystore/mihonmod.jks \
