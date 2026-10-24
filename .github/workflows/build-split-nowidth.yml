@@ -48,7 +48,7 @@ jobs:
           patch -p1 --verbose < ../split-no-width-detect.patch
           patch -p1 --verbose < ../curl-page-turn.patch
           grep -n "拆分双页不检测宽度" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerPageHolder.kt
-          grep -n "CurlPageTransformer" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
+          grep -n "PageCurl" app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
           echo "sdk.dir=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}" > local.properties
 
       - name: Signing key
@@ -92,7 +92,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: MihonSY-curl
+          name: MihonSY-curl2
           path: |
             src/app/build/outputs/apk/**/*.apk
             src/app/build/outputs/mapping/**/*.txt
