@@ -1,190 +1,324 @@
---- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
-+++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/Pager.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/Pager.kt
 @@ -1,6 +1,7 @@
  package eu.kanade.tachiyomi.ui.reader.viewer.pager
  
- import android.graphics.PointF
-+import android.os.Build
- import android.view.InputDevice
+ import android.content.Context
++import android.graphics.Canvas
+ import android.os.Parcelable
+ import android.view.HapticFeedbackConstants
  import android.view.KeyEvent
- import android.view.MotionEvent
-@@ -148,6 +149,16 @@
+@@ -31,6 +32,22 @@
+     // SY -->
+     var isRestoring = false
+ 
++    /** 仿真翻页渲染器；非空时由本类在子 View 之后画卷曲的纸。 */
++    var pageCurl: PageCurl? = null
++
++    override fun dispatchDraw(canvas: Canvas) {
++        val curl = pageCurl
++        if (curl == null) {
++            super.dispatchDraw(canvas)
++            return
++        }
++        val ready = curl.beforeDraw(this)
++        super.dispatchDraw(canvas)
++        if (ready) {
++            curl.draw(canvas, this)
++        }
++    }
++
+     override fun onRestoreInstanceState(state: Parcelable?) {
+         isRestoring = true
+         val currentItem = currentItem
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
+@@ -148,6 +148,12 @@
          pager.offscreenPageLimit = config.offscreenPageLimit
          pager.id = R.id.reader_pager
          pager.adapter = adapter
-+        // MihonSY-patch（仿真翻页）：水平翻页模式换成「纸张卷曲」的转场。
-+        // reverseDrawingOrder = true 让当前页盖在下一页上面，卷起的纸才不会被下页压住。
-+        // 仅 Android 13+（AGSL 运行时着色器），低版本保持原生滑动。
-+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-+            when (this) {
-+                is L2RPagerViewer -> pager.setPageTransformer(true, CurlPageTransformer(mirrored = false))
-+                is R2LPagerViewer -> pager.setPageTransformer(true, CurlPageTransformer(mirrored = true))
-+                else -> {}
-+            }
++        // MihonSY-patch（仿真翻页）：水平翻页模式走纸张卷曲转场（Canvas 实现，不依赖着色器）。
++        if (this is L2RPagerViewer) {
++            pager.pageCurl = PageCurl(mirrored = false)
++        } else if (this is R2LPagerViewer) {
++            pager.pageCurl = PageCurl(mirrored = true)
 +        }
          pager.addOnPageChangeListener(pagerListener)
          pager.tapListener = { event ->
              val viewPosition = IntArray(2)
---- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/CurlPageTransformer.kt
-+++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/CurlPageTransformer.kt
-@@ -0,0 +1,160 @@
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PageCurl.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PageCurl.kt
+@@ -0,0 +1,273 @@
 +package eu.kanade.tachiyomi.ui.reader.viewer.pager
 +
-+import android.graphics.RenderEffect
-+import android.graphics.RuntimeShader
-+import android.os.Build
++import android.graphics.Bitmap
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.LinearGradient
++import android.graphics.Matrix
++import android.graphics.Paint
++import android.graphics.Path
++import android.graphics.Shader
 +import android.view.View
-+import androidx.annotation.RequiresApi
-+import androidx.viewpager.widget.ViewPager
++import kotlin.math.PI
++import kotlin.math.abs
 +import kotlin.math.cos
++import kotlin.math.floor
++import kotlin.math.roundToInt
 +import kotlin.math.sin
 +
 +/**
-+ * 仿真翻页（参考悠长漫影的「仿真」档）。
++ * 仿真翻页（纸张卷曲），照悠长漫影「仿真」档的纸面模型重写。
 + *
-+ * 几何：把当前页当成一张纸，沿一条倾斜的折线卷成圆柱。折线右侧的纸包着柱子卷过去，
-+ * 屏幕上看得到的是**纸背**（背面朝观众），柱顶之后纸背压回平铺面、在折线左侧压出一道
-+ * 落影；折线左侧仍是原页。圆柱半圈投影宽度 = 半径 r，弧长 s = r·theta，
-+ * theta = PI - asin(d / r)，所以卷过去的纸在屏幕上是被镜像压缩的。
++ * 当前页沿一条倾斜折线卷成圆柱，卷过去的纸背翻到近侧悬在页面上方，折线远侧露出下一页。
++ * 分三块画：
++ *  1. 平铺段 d <= 0：原页，靠近折线压一道落影；
++ *  2. 卷柱段 0 < d <= PI*r：投影宽 r 的柱面，看到的是纸背，柱顶亮、折线处暗；
++ *  3. 翻折段 d > PI*r：纸背平铺在近侧，位置 = 关于折线镜像再沿法线推 PI*r，
++ *     叠 12% 透字，前缘压暗。
 + *
-+ * 着色照抄悠长漫影 fragment 里的口径：纸背 = 空白纸色混 12% 背面内容，
-+ * 法线 n = (n̂·sin theta, -cos theta)，主光 (-0.35, 0.30, 0.88)，
-+ * 漫反射 0.58 + 0.42·NdotL 再叠一道掠射高光。
-+ *
-+ * 实现走 RuntimeShader（AGSL，Android 13 / API 33 起）：ViewPager 只推进 position，
-+ * 页面形变全部在 GPU 上逐像素重采样。着色器编译失败或系统低于 13 时本类不接管，
-+ * 保持原生滑动，绝不让阅读器崩在打开阶段。
++ * d = p·n̂ - fold，n̂ 是折线法线（略上倾），fold 随进度从远角扫到近角。
++ * 全走 Canvas（Path + Matrix + 位图），不依赖 RenderEffect / AGSL，API 26 起可用。
 + */
-+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
-+class CurlPageTransformer(
-+    /** R2L（日漫右开）时整幅画面左右镜像，折线改到左侧。 */
++class PageCurl(
++    /** R2L（日漫右开）时整幅画面左右镜像。 */
 +    private val mirrored: Boolean,
-+) : ViewPager.PageTransformer {
++) {
++    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
++    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
++    private val matrix = Matrix()
++    private val path = Path()
 +
-+    private val shader: RuntimeShader? = runCatching { RuntimeShader(CURL_AGSL) }.getOrNull()
++    private var page: Bitmap? = null
++    private var pageView: View? = null
++    private var lastScrollX = -1
++    private var outLeft = 0
++    private var progress = 0f
 +
-+    override fun transformPage(page: View, position: Float) {
-+        val s = shader ?: return
-+        val width = page.width
-+        if (width <= 0) return
++    /** 每帧画前调用：钉住进来那页、藏起翻走那页并截好图。返回是否可以画卷曲。 */
++    fun beforeDraw(pager: Pager): Boolean {
++        val w = pager.width
++        val h = pager.height
++        if (w <= 0 || h <= 0) return false
 +
-+        // 抵消 ViewPager 的平移：纸面钉在屏幕原位，滚动只用来推进 position。
-+        // |position| > 1 的页照常停在屏幕外，别让它们叠上来。
-+        page.translationX = when {
-+            position > 1f -> -width.toFloat()
-+            position < -1f -> width.toFloat()
-+            else -> -position * width
++        val sx = pager.scrollX
++        val f = sx.toFloat() / w
++        val base = floor(f).toInt()
++        val frac = f - base
++
++        if (frac < 0.0005f) {
++            restore(pager)
++            lastScrollX = sx
++            return false
 +        }
 +
-+        if (position < -1f || position > 1f) {
-+            page.setRenderEffect(null)
-+            return
++        val dir = if (lastScrollX < 0 || sx >= lastScrollX) 1 else -1
++        lastScrollX = sx
++        val outIndex = if (dir > 0) base else base + 1
++        val prog = if (dir > 0) frac else 1f - frac
++
++        var out: View? = null
++        var inc: View? = null
++        for (i in 0 until pager.childCount) {
++            val c = pager.getChildAt(i)
++            val idx = (c.left.toFloat() / w).roundToInt()
++            if (idx == outIndex) out = c
++            if (idx == outIndex + dir) inc = c
++        }
++        val outgoing = out ?: return false
++
++        inc?.let {
++            val tx = -(it.left - sx).toFloat()
++            if (abs(it.translationX - tx) > 0.5f) it.translationX = tx
++            if (it.alpha != 1f) it.alpha = 1f
 +        }
 +
-+        val height = page.height
-+        if (height <= 0) return
-+
-+        // u：镜像归一化后的位置。u < 0 = 正在被卷走的那页，u > 0 = 底下被揭开的那页。
-+        val u = if (mirrored) -position else position
-+        if (u > 0f) {
-+            page.setRenderEffect(null)
-+            return
++        if (pageView !== outgoing) {
++            capture(outgoing, w, h)
++            pageView = outgoing
 +        }
++        if (outgoing.alpha != 0f) outgoing.alpha = 0f
 +
-+        val progress = (-u).coerceIn(0f, 1f)
-+        if (progress < MIN_PROGRESS) {
-+            page.setRenderEffect(null)
-+            return
++        outLeft = outgoing.left
++        progress = prog
++        return page != null
++    }
++
++    private fun restore(pager: Pager) {
++        for (i in 0 until pager.childCount) {
++            val c = pager.getChildAt(i)
++            if (c.translationX != 0f) c.translationX = 0f
++            if (c.alpha != 1f) c.alpha = 1f
 +        }
++    }
 +
-+        val w = width.toFloat()
-+        val h = height.toFloat()
-+        // 折线法线：向右、略向上倾斜，右上角先被掀起
++    private fun capture(view: View, w: Int, h: Int) {
++        val old = page
++        val bmp = if (old != null && old.width == w && old.height == h && !old.isRecycled) {
++            old
++        } else {
++            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
++        }
++        bmp.eraseColor(Color.TRANSPARENT)
++        view.draw(Canvas(bmp))
++        page = bmp
++    }
++
++    /** 在 pager 的 canvas 上把卷曲的纸画出来（子 View 之后调用）。 */
++    fun draw(canvas: Canvas, pager: Pager) {
++        val bmp = page ?: return
++        val w = pager.width.toFloat()
++        val h = pager.height.toFloat()
++        if (w <= 0f || h <= 0f) return
++
++        val save = canvas.save()
++        canvas.translate((pager.scrollX - outLeft).toFloat(), pager.scrollY.toFloat())
++        if (mirrored) canvas.scale(-1f, 1f, w / 2f, h / 2f)
++
 +        val nx = cos(TILT)
 +        val ny = -sin(TILT)
-+        // 折线位置 = 全页投影区间的插值：progress 0 时在远角外（没卷），1 时扫到近角
++        val r = (w * CURL_RADIUS_RATIO).coerceAtLeast(MIN_RADIUS)
 +        val projMax = maxOf(0f, w * nx, h * ny, w * nx + h * ny)
 +        val projMin = minOf(0f, w * nx, h * ny, w * nx + h * ny)
 +        val fold = projMax - (projMax - projMin) * progress
++        val piR = PI.toFloat() * r
++        val rect = floatArrayOf(0f, 0f, w, 0f, w, h, 0f, h)
 +
-+        s.setFloatUniform("uSize", w, h)
-+        s.setFloatUniform("uN", nx, ny)
-+        s.setFloatUniform("uFold", fold)
-+        s.setFloatUniform("uRadius", (w * CURL_RADIUS_RATIO).coerceAtLeast(MIN_RADIUS_PX))
-+        s.setFloatUniform("uMirror", if (mirrored) 1f else 0f)
-+        page.setRenderEffect(RenderEffect.createRuntimeShaderEffect(s, CHILD_SHADER))
++        // ---- 1. 平铺段 ----
++        val flat = clip(rect, nx, ny, fold, keepLess = true)
++        if (flat != null) {
++            val s = canvas.save()
++            canvas.clipPath(toPath(flat))
++            canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
++            fillPaint.shader = LinearGradient(
++                nx * fold, ny * fold,
++                nx * (fold - SHADOW_WIDTH * r), ny * (fold - SHADOW_WIDTH * r),
++                intArrayOf(0x90000000.toInt(), 0x00000000),
++                floatArrayOf(0f, 1f),
++                Shader.TileMode.CLAMP,
++            )
++            canvas.drawRect(0f, 0f, w, h, fillPaint)
++            fillPaint.shader = null
++            canvas.restoreToCount(s)
++        }
++
++        // ---- 2. 卷柱段 ----
++        val farSide = clip(rect, nx, ny, fold, keepLess = false)
++        val band = farSide?.let { clip(it, nx, ny, fold + r, keepLess = true) }
++        if (band != null) {
++            val s = canvas.save()
++            canvas.clipPath(toPath(band))
++            fillPaint.shader = null
++            fillPaint.color = PAPER
++            canvas.drawRect(0f, 0f, w, h, fillPaint)
++            fillPaint.shader = LinearGradient(
++                nx * fold, ny * fold,
++                nx * (fold + r), ny * (fold + r),
++                intArrayOf(0x66000000, 0x00000000, 0x22FFFFFF),
++                floatArrayOf(0f, 0.5f, 1f),
++                Shader.TileMode.CLAMP,
++            )
++            canvas.drawRect(0f, 0f, w, h, fillPaint)
++            fillPaint.shader = null
++            canvas.restoreToCount(s)
++        }
++
++        // ---- 3. 翻折段 ----
++        val far = clip(rect, nx, ny, fold + piR, keepLess = false)
++        if (far != null) {
++            val flap = FloatArray(far.size)
++            var i = 0
++            while (i + 1 < far.size) {
++                val x = far[i]
++                val y = far[i + 1]
++                val d = x * nx + y * ny - fold
++                val off = piR - 2f * d
++                flap[i] = x + nx * off
++                flap[i + 1] = y + ny * off
++                i += 2
++            }
++
++            val s = canvas.save()
++            canvas.clipPath(toPath(flap))
++            fillPaint.shader = null
++            fillPaint.color = PAPER
++            canvas.drawRect(0f, 0f, w, h, fillPaint)
++
++            // 纸背透字：关于折线镜像
++            matrix.setValues(
++                floatArrayOf(
++                    1f - 2f * nx * nx, -2f * nx * ny, nx * (2f * fold + piR),
++                    -2f * ny * nx, 1f - 2f * ny * ny, ny * (2f * fold + piR),
++                    0f, 0f, 1f,
++                ),
++            )
++            bitmapPaint.alpha = SHOW_THROUGH
++            canvas.drawBitmap(bmp, matrix, bitmapPaint)
++            bitmapPaint.alpha = 255
++
++            // 前缘压暗，纸背有点厚度
++            fillPaint.shader = LinearGradient(
++                nx * fold, ny * fold,
++                nx * (fold - piR), ny * (fold - piR),
++                intArrayOf(0x00000000, 0x33000000),
++                floatArrayOf(0f, 1f),
++                Shader.TileMode.CLAMP,
++            )
++            canvas.drawRect(0f, 0f, w, h, fillPaint)
++            fillPaint.shader = null
++            canvas.restoreToCount(s)
++        }
++
++        canvas.restoreToCount(save)
++    }
++
++    private fun toPath(poly: FloatArray): Path {
++        path.reset()
++        path.moveTo(poly[0], poly[1])
++        var i = 2
++        while (i + 1 < poly.size) {
++            path.lineTo(poly[i], poly[i + 1])
++            i += 2
++        }
++        path.close()
++        return path
++    }
++
++    /** 多边形按半平面 {p·n̂ <= c}（或 >=）裁剪，返回顶点序列。 */
++    private fun clip(src: FloatArray, nx: Float, ny: Float, c: Float, keepLess: Boolean): FloatArray? {
++        if (src.size < 6) return null
++        val out = FloatArray(src.size + 8)
++        var n = 0
++        val count = src.size / 2
++        val sign = if (keepLess) 1f else -1f
++        for (i in 0 until count) {
++            val ax = src[i * 2]
++            val ay = src[i * 2 + 1]
++            val j = (i + 1) % count
++            val bx = src[j * 2]
++            val by = src[j * 2 + 1]
++            val da = (ax * nx + ay * ny - c) * sign
++            val db = (bx * nx + by * ny - c) * sign
++            if (da <= 0f) {
++                out[n++] = ax
++                out[n++] = ay
++            }
++            if ((da < 0f && db > 0f) || (da > 0f && db < 0f)) {
++                val t = da / (da - db)
++                out[n++] = ax + (bx - ax) * t
++                out[n++] = ay + (by - ay) * t
++            }
++        }
++        if (n < 6) return null
++        return out.copyOf(n)
 +    }
 +
 +    private companion object {
-+        /** RenderEffect 里被子 shader 的名字，必须和 AGSL 的 uniform shader 同名。 */
-+        const val CHILD_SHADER = "content"
-+
-+        /** 折线倾角（弧度）。0.20 ≈ 11.5°，右上角先卷。 */
 +        const val TILT = 0.20f
-+
-+        /** 卷柱半径占页宽比例：0.11 ≈ 1080 宽时 119px。 */
-+        const val CURL_RADIUS_RATIO = 0.11f
-+        const val MIN_RADIUS_PX = 10f
-+
-+        /** 位置小于这个值就当没在卷，省掉一次离屏合成。 */
-+        const val MIN_PROGRESS = 0.004f
-+
-+        const val CURL_AGSL = """
-+            uniform shader content;
-+            uniform float2 uSize;
-+            uniform float2 uN;
-+            uniform float uFold;
-+            uniform float uRadius;
-+            uniform float uMirror;
-+
-+            half4 main(float2 coord) {
-+                float w = uSize.x;
-+                float2 p = coord;
-+                float2 n = uN;
-+                if (uMirror > 0.5) {
-+                    p.x = w - p.x;
-+                    n.x = -n.x;
-+                }
-+
-+                float r = max(uRadius, 1.0);
-+                float d = dot(p, n) - uFold;
-+
-+                // 还没卷到的平铺部分：原样输出，贴折线处压一道卷起纸的落影
-+                if (d < 0.0) {
-+                    half4 c = content.eval(coord);
-+                    float shade = 1.0 - 0.38 * exp(d / (r * 0.9));
-+                    return half4(c.rgb * half(shade), c.a);
-+                }
-+
-+                // 柱体之外：纸已经卷过去，让出底下那页
-+                if (d > r) {
-+                    return half4(0.0);
-+                }
-+
-+                // 卷起的半圈：theta 从 PI（折线处，纸背正对镜头）到 PI/2（柱顶）
-+                float theta = 3.14159265 - asin(clamp(d / r, -1.0, 1.0));
-+                float s = r * theta;
-+                float2 src = p + n * (s - d);
-+                if (uMirror > 0.5) {
-+                    src.x = w - src.x;
-+                }
-+
-+                float3 paper = float3(0.985, 0.98, 0.963);
-+                half4 back = half4(half3(paper), 1.0);
-+                if (src.x >= 0.0 && src.x <= w && src.y >= 0.0 && src.y <= uSize.y) {
-+                    half4 t = content.eval(src);
-+                    back = half4(half3(mix(paper, float3(t.rgb), 0.12)), 1.0);
-+                }
-+
-+                // 纸背法线：平面分量 n̂·sin(theta)，朝观众分量 -cos(theta)
-+                float3 nb = float3(n.x * sin(theta), n.y * sin(theta), -cos(theta));
-+                float3 L = normalize(float3(-0.35, 0.30, 0.88));
-+                float ndl = max(0.0, dot(nb, L));
-+                float lit = 0.58 + 0.42 * ndl;
-+                lit += 0.10 * pow(ndl, 24.0);
-+
-+                return half4(back.rgb * half(lit), 1.0);
-+            }
-+        """
++        const val CURL_RADIUS_RATIO = 0.055f
++        const val MIN_RADIUS = 12f
++        const val SHADOW_WIDTH = 2.2f
++        const val SHOW_THROUGH = 30
++        const val PAPER = 0xFFFCFAF4.toInt()
 +    }
 +}
