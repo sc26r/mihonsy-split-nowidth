@@ -1,0 +1,209 @@
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
+@@ -1,6 +1,7 @@
+ package eu.kanade.tachiyomi.ui.reader.viewer.pager
+ 
+ import android.graphics.PointF
++import android.os.Build
+ import android.view.InputDevice
+ import android.view.KeyEvent
+ import android.view.MotionEvent
+@@ -148,6 +149,16 @@
+         pager.offscreenPageLimit = config.offscreenPageLimit
+         pager.id = R.id.reader_pager
+         pager.adapter = adapter
++        // MihonSY-patch（滚卷翻页）：水平翻页模式换成「纸卷起来滚走」的转场。
++        // reverseDrawingOrder = true 让当前页盖在下一页上面，卷走的纸才不会被下页压住。
++        // 仅 Android 13+（AGSL 运行时着色器），低版本保持原生滑动。
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            when (this) {
++                is L2RPagerViewer -> pager.setPageTransformer(true, RollPageTransformer(mirrored = false))
++                is R2LPagerViewer -> pager.setPageTransformer(true, RollPageTransformer(mirrored = true))
++                else -> {}
++            }
++        }
+         pager.addOnPageChangeListener(pagerListener)
+         pager.tapListener = { event ->
+             val viewPosition = IntArray(2)
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/RollPageTransformer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/RollPageTransformer.kt
+@@ -0,0 +1,179 @@
++package eu.kanade.tachiyomi.ui.reader.viewer.pager
++
++import android.graphics.RenderEffect
++import android.graphics.RuntimeShader
++import android.os.Build
++import android.view.View
++import androidx.annotation.RequiresApi
++import androidx.viewpager.widget.ViewPager
++import kotlin.math.PI
++import kotlin.math.sin
++
++/**
++ * 滚卷翻页（参考悠长漫影的「滚卷」档）。
++ *
++ * 纸面模型：当前页当成一张纸，从前缘开始卷成一根竖直圆柱，圆柱整体向前推进，纸被一路
++ * 卷进柱子里，下一页在底下被逐段揭开；柱面按法线打光（正对镜头最亮、两侧转暗、中间一条
++ * 掠射高光），下一页沿柱脚压一道软阴影。
++ *
++ * 实现走 RuntimeShader（AGSL，Android 13 / API 33 起）：ViewPager 只负责推进
++ * PageTransformer 的 position，页面形变全部在 GPU 上按像素重采样，是真正的卷曲而不是
++ * 整体缩放。着色器编译失败或系统低于 API 33 时本类不接管，保持原生滑动。
++ *
++ * 坐标约定：shader 里 coord 是页面自身的像素坐标（0..width），ViewPager 自带的位移被
++ * translationX 抵消，页面固定贴在 x=0，卷到哪儿由 uProgress 决定。
++ */
++@RequiresApi(Build.VERSION_CODES.TIRAMISU)
++class RollPageTransformer(
++    /** R2L（日漫右开）时整幅画面左右镜像，卷边改到左侧。 */
++    private val mirrored: Boolean,
++) : ViewPager.PageTransformer {
++
++    // 编译失败就是 null，此时整个转场退化成原生滑动，绝不让阅读器崩在打开阶段。
++    private val rollShader: RuntimeShader? = runCatching { RuntimeShader(ROLL_AGSL) }.getOrNull()
++    private val shadowShader: RuntimeShader? = runCatching { RuntimeShader(SHADOW_AGSL) }.getOrNull()
++
++    override fun transformPage(page: View, position: Float) {
++        val roll = rollShader ?: return
++        val shadow = shadowShader ?: return
++
++        val width = page.width
++        if (width <= 0) return
++
++        // 抵消 ViewPager 的平移：纸面钉在屏幕原位，滚动只用来推进 position。
++        // |position| > 1 的页照常停在屏幕外，别让它们叠上来。
++        page.translationX = when {
++            position > 1f -> -width.toFloat()
++            position < -1f -> width.toFloat()
++            else -> -position * width
++        }
++
++        if (position < -1f || position > 1f) {
++            page.setRenderEffect(null)
++            return
++        }
++
++        val height = page.height
++        if (height <= 0) return
++
++        val radius = (width * ROLL_RADIUS_RATIO).coerceAtLeast(MIN_RADIUS_PX)
++
++        // u：镜像归一化后的位置。u < 0 = 正在卷走的纸，u > 0 = 底下被揭开的纸。
++        val u = if (mirrored) -position else position
++
++        if (u <= 0f) {
++            val progress = (-u).coerceIn(0f, 1f)
++            if (progress < MIN_PROGRESS) {
++                page.setRenderEffect(null)
++                return
++            }
++            roll.setFloatUniform("uSize", width.toFloat(), height.toFloat())
++            roll.setFloatUniform("uProgress", progress)
++            roll.setFloatUniform("uRadius", radius)
++            roll.setFloatUniform("uMirror", if (mirrored) 1f else 0f)
++            page.setRenderEffect(RenderEffect.createRuntimeShaderEffect(roll, CHILD_SHADER))
++        } else {
++            val strength = (sin(PI * u) * SHADOW_STRENGTH).toFloat()
++            if (strength < MIN_SHADOW) {
++                page.setRenderEffect(null)
++                return
++            }
++            shadow.setFloatUniform("uSize", width.toFloat(), height.toFloat())
++            shadow.setFloatUniform("uBandX", u * width + radius)
++            shadow.setFloatUniform("uRadius", radius)
++            shadow.setFloatUniform("uStrength", strength)
++            shadow.setFloatUniform("uMirror", if (mirrored) 1f else 0f)
++            page.setRenderEffect(RenderEffect.createRuntimeShaderEffect(shadow, CHILD_SHADER))
++        }
++    }
++
++    private companion object {
++        /** RenderEffect 里被子 shader 的名字，必须和 AGSL 的 uniform shader 同名。 */
++        const val CHILD_SHADER = "content"
++
++        /** 卷柱半径占页宽比例：0.05 约等于 1080 宽时 54px，一卷约 170px 弧长。 */
++        const val ROLL_RADIUS_RATIO = 0.05f
++        const val MIN_RADIUS_PX = 8f
++
++        /** 位置小于这个值就当没在卷，省掉一次离屏合成。 */
++        const val MIN_PROGRESS = 0.004f
++
++        /** 底页落影最大强度。 */
++        const val SHADOW_STRENGTH = 0.34f
++        const val MIN_SHADOW = 0.004f
++
++        /**
++         * 卷柱着色：x 在 [flatX, flatX+2r] 之间是圆柱正面，theta = acos(dx/r) 从 3.14159
++         * （切点）到 0（前缘）；弧长从切点起算回采原图，法线 nz = sin(theta) 决定明暗。
++         */
++        const val ROLL_AGSL = """
++            uniform shader content;
++            uniform float2 uSize;
++            uniform float uProgress;
++            uniform float uRadius;
++            uniform float uMirror;
++
++            half4 main(float2 coord) {
++                float w = uSize.x;
++                float x = coord.x;
++                if (uMirror > 0.5) {
++                    x = w - x;
++                }
++
++                float flatX = w * (1.0 - uProgress);
++                float r = max(uRadius, 1.0);
++                float cx = flatX + r;
++
++                // 还没卷到的平铺部分：原样输出
++                if (x < flatX) {
++                    return content.eval(coord);
++                }
++
++                // 柱体之外：纸已经卷没了，让出底下那页
++                float dx = x - cx;
++                if (dx < -r || dx > r) {
++                    return half4(0.0);
++                }
++
++                float theta = acos(clamp(dx / r, -1.0, 1.0));
++                float srcX = flatX + r * (3.14159265 - theta);
++                if (srcX > w) {
++                    return half4(0.0);
++                }
++
++                float2 src = float2(uMirror > 0.5 ? (w - srcX) : srcX, coord.y);
++                half4 c = content.eval(src);
++
++                // 柱面着色：正对镜头最亮，两条侧缘转暗，中间一条掠射高光
++                float nz = sin(theta);
++                float lit = 0.60 + 0.40 * nz;
++                lit += 0.16 * pow(nz, 10.0);
++                // 切点处纸刚刚离地，压一点接触阴影
++                lit *= mix(0.88, 1.0, smoothstep(1.7278, 3.14159265, theta));
++
++                return half4(c.rgb * half(lit), c.a);
++            }
++        """
++
++        /** 底页落影：以卷柱中心为最暗点，向揭示侧 1.6 个半径内渐隐。 */
++        const val SHADOW_AGSL = """
++            uniform shader content;
++            uniform float2 uSize;
++            uniform float uBandX;
++            uniform float uRadius;
++            uniform float uStrength;
++            uniform float uMirror;
++
++            half4 main(float2 coord) {
++                half4 c = content.eval(coord);
++                float x = coord.x;
++                if (uMirror > 0.5) {
++                    x = uSize.x - x;
++                }
++                float d = (x - uBandX) / max(uRadius, 1.0);
++                float shade = 1.0 - uStrength * (1.0 - smoothstep(0.0, 1.6, d));
++                return half4(c.rgb * half(shade), c.a);
++            }
++        """
++    }
++}
