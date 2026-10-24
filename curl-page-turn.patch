@@ -48,37 +48,40 @@
              val viewPosition = IntArray(2)
 --- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PageCurl.kt
 +++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PageCurl.kt
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,375 @@
 +package eu.kanade.tachiyomi.ui.reader.viewer.pager
 +
 +import android.graphics.Bitmap
 +import android.graphics.Canvas
 +import android.graphics.Color
 +import android.graphics.LinearGradient
-+import android.graphics.Matrix
 +import android.graphics.Paint
 +import android.graphics.Path
++import android.graphics.Rect
++import android.graphics.RectF
 +import android.graphics.Shader
 +import android.view.View
 +import kotlin.math.PI
 +import kotlin.math.abs
 +import kotlin.math.cos
 +import kotlin.math.floor
++import kotlin.math.min
 +import kotlin.math.roundToInt
 +import kotlin.math.sin
 +
 +/**
-+ * 仿真翻页（纸张卷曲），照悠长漫影「仿真」档的纸面模型重写。
++ * 仿真翻页，照 cmbok（hlning/cmbok_app）`lib/widgets/book_page_curl.dart` 的模型移植。
 + *
-+ * 当前页沿一条倾斜折线卷成圆柱，卷过去的纸背翻到近侧悬在页面上方，折线远侧露出下一页。
-+ * 分三块画：
-+ *  1. 平铺段 d <= 0：原页，靠近折线压一道落影；
-+ *  2. 卷柱段 0 < d <= PI*r：投影宽 r 的柱面，看到的是纸背，柱顶亮、折线处暗；
-+ *  3. 翻折段 d > PI*r：纸背平铺在近侧，位置 = 关于折线镜像再沿法线推 PI*r，
-+ *     叠 12% 透字，前缘压暗。
++ * 竖直卷轴、三段圆柱：
++ *  1. 未卷平面段：卷轴外侧的原页，z=0，原样显示；
++ *  2. 卷曲圆柱段：半径 R=0.10w，弧角 θ=p·π。φ<90° 是正面（图片随曲面压缩），
++ *     φ>90° 是纸背（纯纸色，不带镜像文字）；
++ *  3. 已翻平面段：从圆柱末端沿切线 (cosθ, sinθ) 平铺出去的剩余纸张，也是纸背。
++ * 整体套透视相机（camD=3.5w）做近大远小，另加目标页落影（0.26·sin(pπ)）和
++ * 页内自阴影（平面段 0.20·sin(pπ)·t、卷曲段 0.34·(1-φ/90°)）。
 + *
-+ * d = p·n̂ - fold，n̂ 是折线法线（略上倾），fold 随进度从远角扫到近角。
-+ * 全走 Canvas（Path + Matrix + 位图），不依赖 RenderEffect / AGSL，API 26 起可用。
++ * 参考实现逐列 clipPath + drawImageRect 保证文字贴着曲面走；这里同样逐列画位图条带。
++ * 全走 Canvas，不依赖 RenderEffect / AGSL，API 26 起可用。
 + */
 +class PageCurl(
 +    /** R2L（日漫右开）时整幅画面左右镜像。 */
@@ -86,14 +89,16 @@
 +) {
 +    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 +    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-+    private val matrix = Matrix()
 +    private val path = Path()
++    private val srcRect = Rect()
++    private val dstRect = RectF()
 +
 +    private var page: Bitmap? = null
 +    private var pageView: View? = null
 +    private var lastScrollX = -1
 +    private var outLeft = 0
 +    private var progress = 0f
++    private var sign = 1
 +
 +    /** 每帧画前调用：钉住进来那页、藏起翻走那页并截好图。返回是否可以画卷曲。 */
 +    fun beforeDraw(pager: Pager): Boolean {
@@ -141,6 +146,7 @@
 +
 +        outLeft = outgoing.left
 +        progress = prog
++        sign = dir
 +        return page != null
 +    }
 +
@@ -175,150 +181,246 @@
 +        canvas.translate((pager.scrollX - outLeft).toFloat(), pager.scrollY.toFloat())
 +        if (mirrored) canvas.scale(-1f, 1f, w / 2f, h / 2f)
 +
-+        val nx = cos(TILT)
-+        val ny = -sin(TILT)
-+        val r = (w * CURL_RADIUS_RATIO).coerceAtLeast(MIN_RADIUS)
-+        val projMax = maxOf(0f, w * nx, h * ny, w * nx + h * ny)
-+        val projMin = minOf(0f, w * nx, h * ny, w * nx + h * ny)
-+        val fold = projMax - (projMax - projMin) * progress
-+        val piR = PI.toFloat() * r
-+        val rect = floatArrayOf(0f, 0f, w, 0f, w, h, 0f, h)
++        val p = progress
++        val s = if (sign >= 0) 1f else -1f
++        val imgW = bmp.width.toFloat()
++        val imgH = bmp.height.toFloat()
 +
-+        // ---- 1. 平铺段 ----
-+        val flat = clip(rect, nx, ny, fold, keepLess = true)
-+        if (flat != null) {
-+            val s = canvas.save()
-+            canvas.clipPath(toPath(flat))
-+            canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
++        val radius = w * RADIUS_RATIO
++        val camD = w * CAMERA_DISTANCE
++        val theta = p * PI.toFloat()
++        val mid = PI.toFloat() / 2f
++        val axisX = if (s > 0f) w * (1f - p) else w * p
++        val curlLen = radius * theta
++        val flatLen = if (s > 0f) axisX else (w - axisX)
++        val flipLen = (w - flatLen - curlLen).coerceIn(0f, w)
++        val flatFar = if (s > 0f) 0f else w
++
++        val cx = w / 2f
++        val cy = h / 2f
++        fun fz(z: Float) = camD / (camD + z)
++        fun px(x: Float, z: Float) = cx + (x - cx) * fz(z)
++        fun py(y: Float, z: Float) = cy + (y - cy) * fz(z)
++
++        // ---- 目标页上的落影 ----
++        val castA = 0.26f * sin(p * PI.toFloat())
++        if (castA > 0.004f) {
++            val sw = w * (SHADOW_MIN + SHADOW_GROW * p)
++            val left = if (s > 0f) axisX else axisX - sw
++            val right = left + sw
 +            fillPaint.shader = LinearGradient(
-+                nx * fold, ny * fold,
-+                nx * (fold - SHADOW_WIDTH * r), ny * (fold - SHADOW_WIDTH * r),
-+                intArrayOf(0x90000000.toInt(), 0x00000000),
++                if (s > 0f) left else right, 0f,
++                if (s > 0f) right else left, 0f,
++                intArrayOf(argb(castA), 0x00000000),
 +                floatArrayOf(0f, 1f),
 +                Shader.TileMode.CLAMP,
 +            )
-+            canvas.drawRect(0f, 0f, w, h, fillPaint)
++            canvas.drawRect(left, 0f, right, h, fillPaint)
 +            fillPaint.shader = null
-+            canvas.restoreToCount(s)
 +        }
 +
-+        // ---- 2. 卷柱段 ----
-+        val farSide = clip(rect, nx, ny, fold, keepLess = false)
-+        val band = farSide?.let { clip(it, nx, ny, fold + r, keepLess = true) }
-+        if (band != null) {
-+            val s = canvas.save()
-+            canvas.clipPath(toPath(band))
-+            fillPaint.shader = null
-+            fillPaint.color = PAPER
-+            canvas.drawRect(0f, 0f, w, h, fillPaint)
-+            fillPaint.shader = LinearGradient(
-+                nx * fold, ny * fold,
-+                nx * (fold + r), ny * (fold + r),
-+                intArrayOf(0x66000000, 0x00000000, 0x22FFFFFF),
-+                floatArrayOf(0f, 0.5f, 1f),
-+                Shader.TileMode.CLAMP,
++        // ---- 未卷平面段（原样，z=0 无透视）----
++        if (flatLen > 0.5f) {
++            val l = min(flatFar, axisX)
++            val r = maxOf(flatFar, axisX)
++            srcRect.set(
++                (l / w * imgW).roundToInt().coerceIn(0, bmp.width),
++                0,
++                (r / w * imgW).roundToInt().coerceIn(0, bmp.width),
++                bmp.height,
 +            )
-+            canvas.drawRect(0f, 0f, w, h, fillPaint)
-+            fillPaint.shader = null
-+            canvas.restoreToCount(s)
-+        }
-+
-+        // ---- 3. 翻折段 ----
-+        val far = clip(rect, nx, ny, fold + piR, keepLess = false)
-+        if (far != null) {
-+            val flap = FloatArray(far.size)
-+            var i = 0
-+            while (i + 1 < far.size) {
-+                val x = far[i]
-+                val y = far[i + 1]
-+                val d = x * nx + y * ny - fold
-+                val off = piR - 2f * d
-+                flap[i] = x + nx * off
-+                flap[i + 1] = y + ny * off
-+                i += 2
++            dstRect.set(l, 0f, r, h)
++            canvas.drawBitmap(bmp, srcRect, dstRect, bitmapPaint)
++            // 平面段自阴影：贴近卷轴处压暗
++            val flatA = 0.20f * sin(p * PI.toFloat())
++            if (flatA > 0.004f) {
++                val back = w * FLAT_SHADOW_WIDTH
++                fillPaint.shader = LinearGradient(
++                    axisX, 0f,
++                    axisX - s * back, 0f,
++                    intArrayOf(argb(flatA), 0x00000000),
++                    floatArrayOf(0f, 1f),
++                    Shader.TileMode.CLAMP,
++                )
++                canvas.drawRect(
++                    min(axisX, axisX - s * back), 0f,
++                    maxOf(axisX, axisX - s * back), h, fillPaint,
++                )
++                fillPaint.shader = null
 +            }
++        }
 +
-+            val s = canvas.save()
-+            canvas.clipPath(toPath(flap))
-+            fillPaint.shader = null
-+            fillPaint.color = PAPER
-+            canvas.drawRect(0f, 0f, w, h, fillPaint)
++        // ---- 卷曲正面（φ 0..min(θ,90°)）----
++        val phiFront = min(theta, mid)
++        if (phiFront > 0.001f) {
++            val cols = CURL_COLUMNS
++            var prevXOrig = axisX
++            var prevX3d = axisX
++            var prevZ = 0f
++            for (k in 1..cols) {
++                val phi = phiFront * k / cols
++                val xOrig = axisX + s * radius * phi
++                val x3d = axisX + s * radius * sin(phi)
++                val z = radius * (1f - cos(phi))
++                val x0 = px(prevX3d, prevZ)
++                val x1 = px(x3d, z)
++                val top0 = py(0f, prevZ)
++                val top1 = py(0f, z)
++                val bot0 = py(h, prevZ)
++                val bot1 = py(h, z)
++                drawColumn(canvas, bmp, imgW, imgH, prevXOrig, xOrig, x0, x1, top0, top1, bot0, bot1)
++                // 卷曲段自阴影：近轴最暗
++                val a = 0.34f * (1f - ((k - 1).toFloat() / cols))
++                if (a > 0.01f) {
++                    path.reset()
++                    path.moveTo(x0, top0)
++                    path.lineTo(x1, top1)
++                    path.lineTo(x1, bot1)
++                    path.lineTo(x0, bot0)
++                    path.close()
++                    fillPaint.color = argb(a)
++                    canvas.drawPath(path, fillPaint)
++                }
++                prevXOrig = xOrig
++                prevX3d = x3d
++                prevZ = z
++            }
++        }
 +
-+            // 纸背透字：关于折线镜像
-+            matrix.setValues(
-+                floatArrayOf(
-+                    1f - 2f * nx * nx, -2f * nx * ny, nx * (2f * fold + piR),
-+                    -2f * ny * nx, 1f - 2f * ny * ny, ny * (2f * fold + piR),
-+                    0f, 0f, 1f,
-+                ),
-+            )
-+            bitmapPaint.alpha = SHOW_THROUGH
-+            canvas.drawBitmap(bmp, matrix, bitmapPaint)
-+            bitmapPaint.alpha = 255
++        // ---- 卷曲背面（φ 90°..θ），纸背填色 ----
++        if (theta > mid) {
++            val backC = CURL_COLUMNS
++            val span = theta - mid
++            var prevPhi = mid
++            var prevX = px(axisX + s * radius * sin(prevPhi), radius * (1f - cos(prevPhi)))
++            var prevTop = py(0f, radius * (1f - cos(prevPhi)))
++            var prevBot = py(h, radius * (1f - cos(prevPhi)))
++            for (k in 1..backC) {
++                val phi = mid + span * k / backC
++                val x3d = axisX + s * radius * sin(phi)
++                val z = radius * (1f - cos(phi))
++                val x = px(x3d, z)
++                val tTop = py(0f, z)
++                val tBot = py(h, z)
++                path.reset()
++                path.moveTo(prevX, prevTop)
++                path.lineTo(x, tTop)
++                path.lineTo(x, tBot)
++                path.lineTo(prevX, prevBot)
++                path.close()
++                fillPaint.color = lerpColor(BACK_BASE, BACK_DARK, (k - 0.5f) / backC)
++                canvas.drawPath(path, fillPaint)
++                prevX = x
++                prevTop = tTop
++                prevBot = tBot
++            }
++        }
 +
-+            // 前缘压暗，纸背有点厚度
-+            fillPaint.shader = LinearGradient(
-+                nx * fold, ny * fold,
-+                nx * (fold - piR), ny * (fold - piR),
-+                intArrayOf(0x00000000, 0x33000000),
-+                floatArrayOf(0f, 1f),
-+                Shader.TileMode.CLAMP,
-+            )
-+            canvas.drawRect(0f, 0f, w, h, fillPaint)
-+            fillPaint.shader = null
-+            canvas.restoreToCount(s)
++        // ---- 已翻段：沿圆柱切线平铺的纸背 ----
++        if (flipLen > 0.5f) {
++            val flipC = FLIP_COLUMNS
++            val ex = axisX + s * radius * sin(theta)
++            val ez = radius * (1f - cos(theta))
++            val tx = cos(theta)
++            val tz = sin(theta)
++            var pTop = py(0f, ez)
++            var pBot = py(h, ez)
++            var pX = px(ex, ez)
++            for (k in 1..flipC) {
++                val len = flipLen * k / flipC
++                val x3d = ex + s * len * tx
++                val z = ez + len * tz
++                val tTop = py(0f, z)
++                val tBot = py(h, z)
++                val x = px(x3d, z)
++                path.reset()
++                path.moveTo(pX, pTop)
++                path.lineTo(x, tTop)
++                path.lineTo(x, tBot)
++                path.lineTo(pX, pBot)
++                path.close()
++                fillPaint.color = lerpColor(BACK_BASE, BACK_DARK, ((k - 0.5f) / flipC) * 0.7f)
++                canvas.drawPath(path, fillPaint)
++                pTop = tTop
++                pBot = tBot
++                pX = x
++            }
 +        }
 +
 +        canvas.restoreToCount(save)
 +    }
 +
-+    private fun toPath(poly: FloatArray): Path {
++    /** 把位图竖条 [xOrig0,xOrig1] 画进 (x0,x1)×(top..bot) 的四边形，clipPath 塑形。 */
++    private fun drawColumn(
++        canvas: Canvas,
++        bmp: Bitmap,
++        imgW: Float,
++        imgH: Float,
++        xOrig0: Float,
++        xOrig1: Float,
++        x0: Float,
++        x1: Float,
++        top0: Float,
++        top1: Float,
++        bot0: Float,
++        bot1: Float,
++    ) {
++        val w = canvas.width.toFloat()
++        if (abs(xOrig1 - xOrig0) < 0.01f) return
++        val sl = min(xOrig0, xOrig1) / w * imgW
++        val sr = maxOf(xOrig0, xOrig1) / w * imgW
++        srcRect.set(
++            sl.roundToInt().coerceIn(0, bmp.width),
++            0,
++            sr.roundToInt().coerceIn(0, bmp.width),
++            bmp.height,
++        )
++        if (srcRect.width() <= 0) return
 +        path.reset()
-+        path.moveTo(poly[0], poly[1])
-+        var i = 2
-+        while (i + 1 < poly.size) {
-+            path.lineTo(poly[i], poly[i + 1])
-+            i += 2
-+        }
++        path.moveTo(x0, top0)
++        path.lineTo(x1, top1)
++        path.lineTo(x1, bot1)
++        path.lineTo(x0, bot0)
 +        path.close()
-+        return path
++        val save = canvas.save()
++        canvas.clipPath(path)
++        dstRect.set(min(x0, x1), min(top0, top1), maxOf(x0, x1), maxOf(bot0, bot1))
++        canvas.drawBitmap(bmp, srcRect, dstRect, bitmapPaint)
++        canvas.restoreToCount(save)
 +    }
 +
-+    /** 多边形按半平面 {p·n̂ <= c}（或 >=）裁剪，返回顶点序列。 */
-+    private fun clip(src: FloatArray, nx: Float, ny: Float, c: Float, keepLess: Boolean): FloatArray? {
-+        if (src.size < 6) return null
-+        val out = FloatArray(src.size + 8)
-+        var n = 0
-+        val count = src.size / 2
-+        val sign = if (keepLess) 1f else -1f
-+        for (i in 0 until count) {
-+            val ax = src[i * 2]
-+            val ay = src[i * 2 + 1]
-+            val j = (i + 1) % count
-+            val bx = src[j * 2]
-+            val by = src[j * 2 + 1]
-+            val da = (ax * nx + ay * ny - c) * sign
-+            val db = (bx * nx + by * ny - c) * sign
-+            if (da <= 0f) {
-+                out[n++] = ax
-+                out[n++] = ay
-+            }
-+            if ((da < 0f && db > 0f) || (da > 0f && db < 0f)) {
-+                val t = da / (da - db)
-+                out[n++] = ax + (bx - ax) * t
-+                out[n++] = ay + (by - ay) * t
-+            }
-+        }
-+        if (n < 6) return null
-+        return out.copyOf(n)
++    private fun argb(a: Float): Int {
++        val v = (a.coerceIn(0f, 1f) * 255).roundToInt()
++        return (v shl 24)
++    }
++
++    private fun lerpColor(c0: Int, c1: Int, t: Float): Int {
++        val k = t.coerceIn(0f, 1f)
++        val a = (Color.alpha(c0) + (Color.alpha(c1) - Color.alpha(c0)) * k).roundToInt()
++        val r = (Color.red(c0) + (Color.red(c1) - Color.red(c0)) * k).roundToInt()
++        val g = (Color.green(c0) + (Color.green(c1) - Color.green(c0)) * k).roundToInt()
++        val b = (Color.blue(c0) + (Color.blue(c1) - Color.blue(c0)) * k).roundToInt()
++        return Color.argb(a, r, g, b)
 +    }
 +
 +    private companion object {
-+        const val TILT = 0.20f
-+        const val CURL_RADIUS_RATIO = 0.055f
-+        const val MIN_RADIUS = 12f
-+        const val SHADOW_WIDTH = 2.2f
-+        const val SHOW_THROUGH = 30
-+        const val PAPER = 0xFFFCFAF4.toInt()
++        /** 圆柱半径占页宽比例（cmbok：0.10）。 */
++        const val RADIUS_RATIO = 0.10f
++
++        /** 透视相机距离，以页宽为单位（cmbok：3.5）。 */
++        const val CAMERA_DISTANCE = 3.5f
++
++        const val CURL_COLUMNS = 20
++        const val FLIP_COLUMNS = 10
++
++        /** 平面段自阴影宽度占页宽比例。 */
++        const val FLAT_SHADOW_WIDTH = 0.35f
++
++        /** 目标页落影宽度 = w·(MIN + GROW·p)。 */
++        const val SHADOW_MIN = 0.03f
++        const val SHADOW_GROW = 0.055f
++
++        const val BACK_BASE = 0xFFFBF6EC.toInt()
++        const val BACK_DARK = 0xFFEFE7D6.toInt()
 +    }
 +}
