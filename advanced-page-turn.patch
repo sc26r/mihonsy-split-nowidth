@@ -1,0 +1,104 @@
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/PagerViewer.kt
+@@ -148,6 +148,13 @@
+         pager.offscreenPageLimit = config.offscreenPageLimit
+         pager.id = R.id.reader_pager
+         pager.adapter = adapter
++        // MihonSY-patch（高级翻页）：照 Kotatsu 的 ADVANCED，绕页边做 3D 旋转。
++        // reverseDrawingOrder：L2R 让翻走那页（低 index）压在上面，R2L 反过来。
++        when (this) {
++            is L2RPagerViewer -> pager.setPageTransformer(true, AdvancedPageTransformer())
++            is R2LPagerViewer -> pager.setPageTransformer(false, ReversedAdvancedPageTransformer())
++            else -> {}
++        }
+         pager.addOnPageChangeListener(pagerListener)
+         pager.tapListener = { event ->
+             val viewPosition = IntArray(2)
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/AdvancedPageTransformer.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/reader/viewer/pager/AdvancedPageTransformer.kt
+@@ -0,0 +1,85 @@
++package eu.kanade.tachiyomi.ui.reader.viewer.pager
++
++import android.view.View
++import androidx.viewpager.widget.ViewPager
++
++/**
++ * 高级翻页，照 Kotatsu（Ero-gamer/Kotatsu-Next）`ReaderAnimation.ADVANCED` 的
++ * `PageAnimTransformer` 移植。
++ *
++ * 页面绕自身左边做 3D Y 轴旋转，position 从 0 到 -1 对应 0° → -120°（转过 90° 后
++ * 看到背面镜像），相机距离 20000，当前页压在上层（translationZ = 2），
++ * 相邻页固定在同一位置、不做旋转。全部是 View 变换，不碰着色器。
++ */
++class AdvancedPageTransformer : ViewPager.PageTransformer {
++
++    override fun transformPage(page: View, position: Float) = with(page) {
++        translationX = -position * width
++        pivotX = 0f
++        pivotY = height / 2f
++        cameraDistance = CAMERA_DISTANCE
++        when {
++            position < -1f || position > 1f -> {
++                alpha = 0f
++                rotationY = 0f
++                translationZ = -1f
++            }
++
++            position > 0f -> {
++                alpha = 1f
++                rotationY = 0f
++                translationZ = 0f
++            }
++
++            else -> {
++                alpha = 1f
++                rotationY = ROTATION_DEG * position
++                translationZ = 2f
++            }
++        }
++    }
++
++    private companion object {
++        /** 与 Kotatsu 一致，直接给原始像素值。 */
++        const val CAMERA_DISTANCE = 20000f
++        const val ROTATION_DEG = 120f
++    }
++}
++
++/**
++ * 高级翻页的右开（R2L）镜像版，对应 Kotatsu 的 `ReversedPageAnimTransformer`：
++ * 绕自身右边旋转，正向 position 才转。
++ */
++class ReversedAdvancedPageTransformer : ViewPager.PageTransformer {
++
++    override fun transformPage(page: View, position: Float) = with(page) {
++        translationX = -position * width
++        pivotX = width.toFloat()
++        pivotY = height / 2f
++        cameraDistance = CAMERA_DISTANCE
++        when {
++            position < -1f || position > 1f -> {
++                alpha = 0f
++                rotationY = 0f
++                translationZ = -1f
++            }
++
++            position <= 0f -> {
++                alpha = 1f
++                rotationY = 0f
++                translationZ = 0f
++            }
++
++            else -> {
++                alpha = 1f
++                rotationY = ROTATION_DEG * position
++                translationZ = 2f
++            }
++        }
++    }
++
++    private companion object {
++        const val CAMERA_DISTANCE = 20000f
++        const val ROTATION_DEG = 120f
++    }
++}
